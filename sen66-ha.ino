@@ -14,6 +14,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+
+// Increase MQTT packet size for HA discovery payloads
+#define MQTT_MAX_PACKET_SIZE 768
+
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
@@ -46,10 +50,10 @@ String avail_topic;
 
 // Runtime settings (loaded/saved via Preferences)
 struct AppConfig {
-  char mqtt_host[64]      = "192.168.1.10";
+  char mqtt_host[64]      = "10.10.10.10";
   char mqtt_port[8]       = "1883";
-  char mqtt_user[64]      = "";
-  char mqtt_pass[64]      = "";
+  char mqtt_user[64]      = "user";
+  char mqtt_pass[64]      = "password";
   char ha_prefix[32]      = "homeassistant";
   char friendly_name[32]  = "SEN66 Air Sensor";
 } cfg;
@@ -169,6 +173,9 @@ void setup() {
   base_topic  = "sen66/" + device_id;
   avail_topic = base_topic + "/status";
 
+  Serial.println("Base topic: " + base_topic);
+  Serial.println("Availability topic: " + avail_topic);
+
   // Start continuous measurement
   error = sensor.startContinuousMeasurement();
   if (error != NO_ERROR) {
@@ -178,6 +185,9 @@ void setup() {
 
   // MQTT server
   mqtt.setServer(cfg.mqtt_host, atoi(cfg.mqtt_port));
+
+  // Increase buffer size for large HA discovery payloads
+  mqtt.setBufferSize(512);
 
   Serial.print("Wi-Fi connected, IP: ");
   Serial.println(WiFi.localIP());
@@ -226,6 +236,14 @@ void loadConfig() {
   strncpy(cfg.mqtt_pass, pass.c_str(), sizeof(cfg.mqtt_pass));
   strncpy(cfg.ha_prefix, pref.c_str(), sizeof(cfg.ha_prefix));
   strncpy(cfg.friendly_name, name.c_str(), sizeof(cfg.friendly_name));
+
+  // Ensure we always have a valid discovery prefix
+  if (strlen(cfg.ha_prefix) == 0) {
+    strncpy(cfg.ha_prefix, "homeassistant", sizeof(cfg.ha_prefix));
+  }
+
+  Serial.printf("Loaded config: MQTT %s:%s, HA prefix: '%s', name: '%s'\n",
+                cfg.mqtt_host, cfg.mqtt_port, cfg.ha_prefix, cfg.friendly_name);
 }
 
 void saveConfig() {
@@ -289,20 +307,26 @@ void publishAvailability(const char* state) {
 }
 
 void publishDiscovery() {
-  String ha = String(cfg.ha_prefix); // e.g., "homeassistant"
+  if (discovery_published) {
+    Serial.println("Discovery already published, skipping.");
+    return;
+  }
 
-  // Each measurement has its own state topic: base_topic/suffix
-  publishConfigSensor("pm1",  "PM1.0",     "µg/m³", "",          "measurement", "mdi:blur", "pm1",  "");
-  publishConfigSensor("pm25", "PM2.5",     "µg/m³", "pm25",      "measurement", "",         "pm25", "");
-  publishConfigSensor("pm4",  "PM4.0",     "µg/m³", "",          "measurement", "mdi:blur", "pm4",  "");
-  publishConfigSensor("pm10", "PM10",      "µg/m³", "pm10",      "measurement", "",         "pm10", "");
-  publishConfigSensor("humidity",    "Humidity",    "%",    "humidity",    "measurement", "", "humidity",    "");
-  publishConfigSensor("temperature", "Temperature", "°C",   "temperature", "measurement", "", "temperature", "");
-  publishConfigSensor("voc_index",   "VOC Index",   "",     "",            "measurement", "mdi:chemical-weapon", "voc_index", "");
-  publishConfigSensor("nox_index",   "NOx Index",   "",     "",            "measurement", "mdi:chemical-weapon", "nox_index", "");
-  publishConfigSensor("co2eq",       "CO2 (eq)",    "ppm",  "carbon_dioxide", "measurement", "", "co2eq", "");
+  Serial.printf("Publishing Home Assistant discovery with prefix '%s' and device_id '%s'\n",
+                cfg.ha_prefix, device_id.c_str());
+
+  publishConfigSensor("pm1",        "PM1.0",       "µg/m³", "pm1",           "measurement", "mdi:blur",            "pm1",        "");
+  publishConfigSensor("pm25",       "PM2.5",       "µg/m³", "pm25",          "measurement", "",                    "pm25",       "");
+  publishConfigSensor("pm4",        "PM4.0",       "µg/m³", "",              "measurement", "mdi:blur",            "pm4",        "");
+  publishConfigSensor("pm10",       "PM10",        "µg/m³", "pm10",          "measurement", "",                    "pm10",       "");
+  publishConfigSensor("humidity",   "Humidity",    "%",     "humidity",      "measurement", "",                    "humidity",   "");
+  publishConfigSensor("temperature","Temperature", "°C",    "temperature",   "measurement", "",                    "temperature","");
+  publishConfigSensor("voc_index",  "VOC Index",   "",      "",              "measurement", "mdi:chemical-weapon", "voc_index",  "");
+  publishConfigSensor("nox_index",  "NOx Index",   "",      "",              "measurement", "mdi:chemical-weapon", "nox_index",  "");
+  publishConfigSensor("co2eq",      "CO2 (eq)",    "ppm",   "carbon_dioxide","measurement", "",                    "co2eq",      "");
 
   discovery_published = true;
+  Serial.println("Discovery publish complete.");
 }
 
 void publishOne(const String& suffix, const String& value) {
@@ -314,15 +338,15 @@ void publishState(float pm1, float pm25, float pm4, float pm10,
                   float rh, float tempC, float vocIndex, float noxIndex, uint16_t co2) {
   if (!discovery_published && mqtt.connected()) publishDiscovery();
 
-  publishOne("pm1",        String(pm1, 1));
-  publishOne("pm25",       String(pm25, 1));
-  publishOne("pm4",        String(pm4, 1));
-  publishOne("pm10",       String(pm10, 1));
-  publishOne("humidity",   String(rh, 1));
-  publishOne("temperature",String(tempC, 2));
-  publishOne("voc_index",  String(vocIndex, 1));
-  publishOne("nox_index",  String(noxIndex, 1));
-  publishOne("co2eq",      String(co2));
+  publishOne("pm1",         String(pm1, 1));
+  publishOne("pm25",        String(pm25, 1));
+  publishOne("pm4",         String(pm4, 1));
+  publishOne("pm10",        String(pm10, 1));
+  publishOne("humidity",    String(rh, 1));
+  publishOne("temperature", String(tempC, 2));
+  publishOne("voc_index",   String(vocIndex, 1));
+  publishOne("nox_index",   String(noxIndex, 1));
+  publishOne("co2eq",       String(co2));
 }
 
 // --------------- Discovery config publisher ---------------
@@ -336,6 +360,7 @@ void publishConfigSensor(
   const String& state_topic_suffix,
   const String& value_template
 ) {
+  // Topic: <prefix>/sensor/<device_id>/<object_id>/config
   String topic = String(cfg.ha_prefix) + "/sensor/" + device_id + "/" + object_id + "/config";
 
   String payload = "{";
@@ -343,6 +368,7 @@ void publishConfigSensor(
   payload += "\"unique_id\":\"" + device_id + "_" + object_id + "\",";
   payload += "\"state_topic\":\"" + base_topic + "/" + state_topic_suffix + "\",";
   payload += "\"availability_topic\":\"" + avail_topic + "\",";
+
   if (unit.length())         payload += "\"unit_of_measurement\":\"" + unit + "\",";
   if (device_class.length()) payload += "\"device_class\":\"" + device_class + "\",";
   if (state_class.length())  payload += "\"state_class\":\"" + state_class + "\",";
@@ -357,7 +383,14 @@ void publishConfigSensor(
   payload += "}";
   payload += "}";
 
-  mqtt.publish(topic.c_str(), payload.c_str(), true);
+  Serial.println("Discovery topic: " + topic);
+  Serial.println("Discovery payload: " + payload);
+  Serial.printf("Payload length for '%s': %d bytes\n",
+                object_id.c_str(), payload.length());
+
+  bool ok = mqtt.publish(topic.c_str(), payload.c_str(), true);
+  Serial.printf("Discovery publish for '%s': %s\n",
+                object_id.c_str(), ok ? "OK" : "FAILED");
 }
 
 // --------------- Utilities ---------------
