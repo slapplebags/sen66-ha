@@ -75,12 +75,12 @@ String avail_topic;
 enum SensorType : uint8_t { SENSOR_SEN66 = 0, SENSOR_BMV080 = 1, SENSOR_PMS = 2 };
 
 struct AppConfig {
-  char mqtt_host[64]      = "10.18.14.36";
+  char mqtt_host[64]      = "10.10.10.10";
   char mqtt_port[8]       = "1883";
-  char mqtt_user[64]      = "front_door";
-  char mqtt_pass[64]      = "!90c6965dD";
+  char mqtt_user[64]      = "user";
+  char mqtt_pass[64]      = "password";
   char ha_prefix[32]      = "homeassistant";
-  char friendly_name[32]  = "Air Sensor PMS5003";
+  char friendly_name[32]  = "Sensor";
   char sensor_type[16]    = "pms"; // "sen66" or "bmv080" or "pms"
 } cfg;
 
