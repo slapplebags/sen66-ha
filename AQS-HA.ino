@@ -34,13 +34,13 @@
 #define CONFIG_TRIGGER_PIN 0
 
 // Publish interval (MQTT + HA entities update cadence)
-const uint32_t READ_INTERVAL_MS = 10000;
+static constexpr uint32_t READ_INTERVAL_MS = 10000;
 
 // BMV080 wants frequent servicing; this keeps it happy even when publishing slower
-const uint32_t BMV_SERVICE_MS = 50;
+static constexpr uint32_t BMV_SERVICE_MS = 50;
 
 // BMV080 default I2C addr on SparkFun breakout
-#define BMV080_ADDR 0x57
+static constexpr uint8_t BMV080_ADDR = 0x57;
 
 // PMS-style UART sensor (Plantower-compatible frames 0x42 0x4D 0x00 0x1C ...)
 static constexpr uint32_t PMS_BAUD = 9600;
@@ -90,29 +90,48 @@ struct AppConfig {
   char mqtt_pass[64]      = "password";
   char ha_prefix[32]      = "homeassistant";
   char friendly_name[32]  = "name";
-  char sensor_type[16]    = "model"; // "sen66" or "bmv080" or "pms" or "ips7100"
+  char sensor_type[16]    = "sen66"; // "sen66"|"bmv080"|"pms"|"ips7100"
 } cfg;
 
-SensorType activeSensor = SENSOR_SEN66;
+static SensorType activeSensor = SENSOR_SEN66;
 
-bool shouldSaveConfig = false;
-bool discovery_published = false;
+static bool shouldSaveConfig = false;
+static bool discovery_published = false;
 
-unsigned long last_publish_ms = 0;
-unsigned long last_bmv_service_ms = 0;
+static unsigned long last_publish_ms = 0;
+static unsigned long last_bmv_service_ms = 0;
 
-// BMV080 cached values (updated frequently)
-float bmv_pm1 = NAN, bmv_pm25 = NAN, bmv_pm10 = NAN;
-bool  bmv_obstructed = false;
-
-// PMS cached values
-uint16_t pms_pm1 = 0, pms_pm25 = 0, pms_pm10 = 0;
-bool pms_has_reading = false;
-
-// IPS7100 cached values (float ug/m3)
-float ips_pm1 = NAN, ips_pm25 = NAN, ips_pm10 = NAN;
-bool  ips_has_reading = false;
+// IPS7100 line buffer
 static String ips_line_buf;
+
+// ---------------- Unified measurement container ----------------
+struct Measurements {
+  // Always publish these (if available) as float µg/m³
+  float pm1  = NAN;
+  float pm25 = NAN;
+  float pm10 = NAN;
+
+  // SEN66-only extra
+  float pm4  = NAN;
+
+  // SEN66 env/index extras
+  float rh      = NAN;
+  float tempC   = NAN;
+  float vocIdx  = NAN;
+  float noxIdx  = NAN;
+  uint16_t co2  = 0;
+  bool has_env  = false;
+
+  // BMV080-only
+  bool obstructed = false;
+  bool has_obstructed = false;
+
+  bool has_pm() const {
+    return !isnan(pm1) && !isnan(pm25) && !isnan(pm10);
+  }
+};
+
+static Measurements meas;
 
 // ---------------- Forward declarations ----------------
 void loadConfig();
@@ -132,20 +151,24 @@ void publishConfigBinarySensor(const String& object_id, const String& name,
                                const String& state_topic_suffix,
                                const String& payload_on, const String& payload_off);
 
-void publishSen66State(float pm1, float pm25, float pm4, float pm10,
-                       float rh, float tempC, float vocIndex, float noxIndex, uint16_t co2);
-
-void publishBmv080State(float pm1, float pm25, float pm10, bool obstructed);
-void publishPmsState(uint16_t pm1, uint16_t pm25, uint16_t pm10);
-void publishIps7100State(float pm1, float pm25, float pm10);
-
 String chipId();
 void safeTopicify(String &s);
+static void normalizeSensorTypeInCfg();
+static SensorType sensorTypeFromCfg();
+static void copyParam(char* dst, size_t dst_sz, const char* src);
 
+// Sensor init
 bool initSen66();
 bool initBmv080();
 bool initPms();
 bool initIps7100();
+
+// Sensor reads into `meas`
+static bool readSen66(Measurements& m);
+static void serviceBmv080(Measurements& m);   // frequent
+static bool readBmv080Snapshot(Measurements& m); // publish-time snapshot
+static bool readPms(Measurements& m);
+static bool serviceIps7100(Measurements& m);  // consume UART continuously
 
 // PMS frame reader
 bool pmsReadAtm(uint16_t &pm1, uint16_t &pm25, uint16_t &pm10);
@@ -153,6 +176,11 @@ bool pmsReadAtm(uint16_t &pm1, uint16_t &pm25, uint16_t &pm10);
 // IPS7100 line reader/parser
 bool ipsReadCsvLine(String &outLine, uint32_t timeout_ms);
 bool ipsParsePmFromLine(const String& line, float &pm1, float &pm25, float &pm10);
+
+// Publishing
+static void publishPmTrio(const Measurements& m);
+static void publishSen66Extras(const Measurements& m);
+static void publishBmv080Extras(const Measurements& m);
 
 // ---------------- WiFiManager save callback ----------------
 void saveConfigCallback() { shouldSaveConfig = true; }
@@ -163,25 +191,17 @@ void setup() {
   delay(100);
 
   pinMode(CONFIG_TRIGGER_PIN, INPUT_PULLUP);
-
   Wire.begin();
 
-  // Load stored config first (so portal defaults are correct)
   loadConfig();
+  normalizeSensorTypeInCfg();
+  activeSensor = sensorTypeFromCfg();
 
-  // Decide active sensor from cfg
-  String st0 = String(cfg.sensor_type);
-  st0.trim(); st0.toLowerCase();
-  if (st0 == "bmv080")        activeSensor = SENSOR_BMV080;
-  else if (st0 == "pms")      activeSensor = SENSOR_PMS;
-  else if (st0 == "ips7100")  activeSensor = SENSOR_IPS7100;
-  else                        activeSensor = SENSOR_SEN66;
-
-  // Create a device_id that is stable and unique per board.
-  device_id = chipId(); // (will be overridden in initSen66/initBmv080/initPms/initIps7100)
+  // Default device_id: per-board; sensors may override (e.g. SEN66 serial)
+  device_id = chipId();
 
   // WiFiManager
-  bool forcePortal = (digitalRead(CONFIG_TRIGGER_PIN) == LOW);
+  const bool forcePortal = (digitalRead(CONFIG_TRIGGER_PIN) == LOW);
 
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
@@ -190,7 +210,6 @@ void setup() {
 
   String apName = "AIR-" + chipId();
 
-  // Custom params for MQTT & HA & Sensor Type
   WiFiManagerParameter p_mqtt_host("mqtt_host", "MQTT Host", cfg.mqtt_host, sizeof(cfg.mqtt_host));
   WiFiManagerParameter p_mqtt_port("mqtt_port", "MQTT Port", cfg.mqtt_port, sizeof(cfg.mqtt_port));
   WiFiManagerParameter p_mqtt_user("mqtt_user", "MQTT User", cfg.mqtt_user, sizeof(cfg.mqtt_user));
@@ -222,24 +241,19 @@ void setup() {
     ESP.restart();
   }
 
-  // Copy values back from portal
-  strncpy(cfg.mqtt_host, p_mqtt_host.getValue(), sizeof(cfg.mqtt_host));
-  strncpy(cfg.mqtt_port, p_mqtt_port.getValue(), sizeof(cfg.mqtt_port));
-  strncpy(cfg.mqtt_user, p_mqtt_user.getValue(), sizeof(cfg.mqtt_user));
-  strncpy(cfg.mqtt_pass, p_mqtt_pass.getValue(), sizeof(cfg.mqtt_pass));
-  strncpy(cfg.ha_prefix, p_ha_prefix.getValue(), sizeof(cfg.ha_prefix));
-  strncpy(cfg.friendly_name, p_friendly.getValue(), sizeof(cfg.friendly_name));
-  strncpy(cfg.sensor_type, p_sensor_type.getValue(), sizeof(cfg.sensor_type));
+  // Copy values back from portal (safe copies)
+  copyParam(cfg.mqtt_host, sizeof(cfg.mqtt_host), p_mqtt_host.getValue());
+  copyParam(cfg.mqtt_port, sizeof(cfg.mqtt_port), p_mqtt_port.getValue());
+  copyParam(cfg.mqtt_user, sizeof(cfg.mqtt_user), p_mqtt_user.getValue());
+  copyParam(cfg.mqtt_pass, sizeof(cfg.mqtt_pass), p_mqtt_pass.getValue());
+  copyParam(cfg.ha_prefix, sizeof(cfg.ha_prefix), p_ha_prefix.getValue());
+  copyParam(cfg.friendly_name, sizeof(cfg.friendly_name), p_friendly.getValue());
+  copyParam(cfg.sensor_type, sizeof(cfg.sensor_type), p_sensor_type.getValue());
 
-  // Normalize sensor type
-  String st = String(cfg.sensor_type);
-  st.trim();
-  st.toLowerCase();
-  if (st != "bmv080" && st != "pms" && st != "ips7100") st = "sen66";
-  strncpy(cfg.sensor_type, st.c_str(), sizeof(cfg.sensor_type));
+  normalizeSensorTypeInCfg();
 
   if (strlen(cfg.ha_prefix) == 0) {
-    strncpy(cfg.ha_prefix, "homeassistant", sizeof(cfg.ha_prefix));
+    strlcpy(cfg.ha_prefix, "homeassistant", sizeof(cfg.ha_prefix));
   }
 
   if (shouldSaveConfig) {
@@ -247,24 +261,15 @@ void setup() {
     Serial.println("Config saved.");
   }
 
-  // Determine active sensor now that config is final
-  String stf = String(cfg.sensor_type);
-  stf.toLowerCase();
-  activeSensor = (stf == "bmv080")  ? SENSOR_BMV080 :
-                 (stf == "pms")     ? SENSOR_PMS :
-                 (stf == "ips7100") ? SENSOR_IPS7100 :
-                                      SENSOR_SEN66;
+  activeSensor = sensorTypeFromCfg();
 
   // Init sensor and compute device_id (SEN66 prefers serial-based id)
   bool sensor_ok = false;
-  if (activeSensor == SENSOR_SEN66) {
-    sensor_ok = initSen66();
-  } else if (activeSensor == SENSOR_BMV080) {
-    sensor_ok = initBmv080();
-  } else if (activeSensor == SENSOR_PMS) {
-    sensor_ok = initPms();
-  } else {
-    sensor_ok = initIps7100();
+  switch (activeSensor) {
+    case SENSOR_SEN66:   sensor_ok = initSen66(); break;
+    case SENSOR_BMV080:  sensor_ok = initBmv080(); break;
+    case SENSOR_PMS:     sensor_ok = initPms(); break;
+    case SENSOR_IPS7100: sensor_ok = initIps7100(); break;
   }
 
   if (!sensor_ok) {
@@ -273,26 +278,24 @@ void setup() {
     ESP.restart();
   }
 
-  // Make sure device_id is safe for topics
   safeTopicify(device_id);
-
   mqtt_client_id = "esp32_" + device_id;
 
-  // Topics depend on sensor type
-  String prefix =
+  // Base topic namespace by sensor type (keeps your existing scheme)
+  const char* prefix =
     (activeSensor == SENSOR_SEN66)   ? "sen66/"   :
     (activeSensor == SENSOR_BMV080)  ? "bmv080/"  :
     (activeSensor == SENSOR_PMS)     ? "pms/"     :
                                        "ips7100/";
-  base_topic  = prefix + device_id;
+
+  base_topic  = String(prefix) + device_id;
   avail_topic = base_topic + "/status";
 
   Serial.println("Base topic: " + base_topic);
   Serial.println("Availability topic: " + avail_topic);
 
-  // MQTT setup
   mqtt.setServer(cfg.mqtt_host, atoi(cfg.mqtt_port));
-  mqtt.setBufferSize(1024);
+  mqtt.setBufferSize(MQTT_MAX_PACKET_SIZE);
 
   Serial.print("Wi-Fi connected, IP: ");
   Serial.println(WiFi.localIP());
@@ -302,81 +305,72 @@ void setup() {
 void loop() {
   ensureMqtt();
 
-  // Keep BMV080 serviced frequently even if we publish slowly
+  // Keep BMV080 serviced frequently even if we publish slower
   if (activeSensor == SENSOR_BMV080) {
-    unsigned long now = millis();
-    if (now - last_bmv_service_ms >= BMV_SERVICE_MS) {
-      last_bmv_service_ms = now;
-
-      if (bmv080.readSensor()) {
-        bmv_pm10 = bmv080.PM10();
-        bmv_pm25 = bmv080.PM25();
-        bmv_pm1  = bmv080.PM1();
-        bmv_obstructed = bmv080.isObstructed();
-      }
-    }
+    serviceBmv080(meas);
   }
 
-  // For IPS7100, keep consuming UART so buffer doesn't overrun.
-  // We parse the latest valid line we see between publishes.
+  // Keep consuming IPS7100 UART so buffer doesn't overrun
   if (activeSensor == SENSOR_IPS7100) {
-    String l;
-    // Non-blocking-ish: grab any complete lines available
-    while (ipsReadCsvLine(l, 0)) {
-      float pm1, pm25, pm10;
-      if (ipsParsePmFromLine(l, pm1, pm25, pm10)) {
-        ips_pm1 = pm1;
-        ips_pm25 = pm25;
-        ips_pm10 = pm10;
-        ips_has_reading = true;
-      }
-    }
+    serviceIps7100(meas);
   }
 
   // Publish cadence
-  unsigned long now = millis();
+  const unsigned long now = millis();
   if (now - last_publish_ms >= READ_INTERVAL_MS) {
     last_publish_ms = now;
 
-    if (activeSensor == SENSOR_SEN66) {
-      float pm1=0, pm25=0, pm4=0, pm10=0;
-      float rh=0, tempC=0, voc=0, nox=0;
-      uint16_t co2=0;
+    Measurements snap; // publish snapshot (avoid partial updates)
+    snap = meas;
 
-      error = sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
-      if (error != NO_ERROR) {
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.printf("SEN66 readMeasuredValues() error: %s\n", errorMessage);
-      } else {
-        Serial.printf("SEN66 PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f RH=%.1f T=%.2f VOC=%.1f NOx=%.1f CO2=%u\n",
-                      pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
-        publishSen66State(pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
-      }
-    } else if (activeSensor == SENSOR_BMV080) {
-      if (!isnan(bmv_pm1) && !isnan(bmv_pm25) && !isnan(bmv_pm10)) {
-        Serial.printf("BMV080 PM1=%.2f PM2.5=%.2f PM10=%.2f Obstructed=%s\n",
-                      bmv_pm1, bmv_pm25, bmv_pm10, bmv_obstructed ? "true" : "false");
-        publishBmv080State(bmv_pm1, bmv_pm25, bmv_pm10, bmv_obstructed);
-      } else {
-        Serial.println("BMV080: no readings yet (still warming/servicing).");
-      }
-    } else if (activeSensor == SENSOR_PMS) {
-      uint16_t pm1=0, pm25=0, pm10=0;
-      if (pmsReadAtm(pm1, pm25, pm10)) {
-        pms_pm1 = pm1; pms_pm25 = pm25; pms_pm10 = pm10;
-        pms_has_reading = true;
-        Serial.printf("PMS (ATM) PM1=%u PM2.5=%u PM10=%u\n", pm1, pm25, pm10);
-        publishPmsState(pm1, pm25, pm10);
-      } else {
-        Serial.println("PMS: no valid frame yet (check wiring/baud).");
-      }
+    bool ok = false;
+
+    switch (activeSensor) {
+      case SENSOR_SEN66:
+        ok = readSen66(snap);
+        if (ok) {
+          Serial.printf("SEN66 PM1=%.1f PM2.5=%.1f PM4=%.1f PM10=%.1f RH=%.1f T=%.2f VOC=%.1f NOx=%.1f CO2=%u\n",
+                        snap.pm1, snap.pm25, snap.pm4, snap.pm10,
+                        snap.rh, snap.tempC, snap.vocIdx, snap.noxIdx, snap.co2);
+        }
+        break;
+
+      case SENSOR_BMV080:
+        ok = readBmv080Snapshot(snap);
+        if (ok) {
+          Serial.printf("BMV080 PM1=%.1f PM2.5=%.1f PM10=%.1f Obstructed=%s\n",
+                        snap.pm1, snap.pm25, snap.pm10, snap.obstructed ? "true" : "false");
+        }
+        break;
+
+      case SENSOR_PMS:
+        ok = readPms(snap);
+        if (ok) {
+          Serial.printf("PMS (ATM) PM1=%.1f PM2.5=%.1f PM10=%.1f\n",
+                        snap.pm1, snap.pm25, snap.pm10);
+        }
+        break;
+
+      case SENSOR_IPS7100:
+        ok = snap.has_pm();
+        if (ok) {
+          Serial.printf("IPS7100 PM1=%.1f PM2.5=%.1f PM10=%.1f\n",
+                        snap.pm1, snap.pm25, snap.pm10);
+        }
+        break;
+    }
+
+    if (ok) {
+      if (!discovery_published && mqtt.connected()) publishDiscovery();
+
+      // Common PM trio always published consistently (float, 1 decimal)
+      publishPmTrio(snap);
+
+      // Sensor-specific extras
+      if (activeSensor == SENSOR_SEN66) publishSen66Extras(snap);
+      if (activeSensor == SENSOR_BMV080) publishBmv080Extras(snap);
     } else {
-      if (ips_has_reading && !isnan(ips_pm1) && !isnan(ips_pm25) && !isnan(ips_pm10)) {
-        Serial.printf("IPS7100 PM1.0=%.3f PM2.5=%.3f PM10=%.3f\n", ips_pm1, ips_pm25, ips_pm10);
-        publishIps7100State(ips_pm1, ips_pm25, ips_pm10);
-      } else {
-        Serial.println("IPS7100: no parsed readings yet (waiting on CSV line).");
-      }
+      Serial.println("No valid readings at publish time.");
     }
   }
 
@@ -432,24 +426,122 @@ bool initBmv080() {
 }
 
 bool initPms() {
-  // Start UART and give sensor time to boot/stream
   pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
   delay(1200);
-
   device_id = "pms_" + chipId();
   return true;
 }
 
 bool initIps7100() {
-  // Start UART at 115200 and allow sensor to start streaming CSV
   pmsSerial.begin(IPS_BAUD, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
   pmsSerial.setTimeout(50);
   ips_line_buf.reserve(256);
-
   delay(500);
-
   device_id = "ips7100_" + chipId();
   return true;
+}
+
+// --------------- Sensor reads/services ---------------
+static bool readSen66(Measurements& m) {
+  float pm1=0, pm25=0, pm4=0, pm10=0;
+  float rh=0, tempC=0, voc=0, nox=0;
+  uint16_t co2=0;
+
+  error = sen66.readMeasuredValues(pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
+  if (error != NO_ERROR) {
+    errorToString(error, errorMessage, sizeof errorMessage);
+    Serial.printf("SEN66 readMeasuredValues() error: %s\n", errorMessage);
+    return false;
+  }
+
+  m.pm1  = pm1;
+  m.pm25 = pm25;
+  m.pm4  = pm4;
+  m.pm10 = pm10;
+
+  m.rh     = rh;
+  m.tempC  = tempC;
+  m.vocIdx = voc;
+  m.noxIdx = nox;
+  m.co2    = co2;
+  m.has_env = true;
+
+  return true;
+}
+
+static void serviceBmv080(Measurements& m) {
+  const unsigned long now = millis();
+  if (now - last_bmv_service_ms < BMV_SERVICE_MS) return;
+  last_bmv_service_ms = now;
+
+  if (bmv080.readSensor()) {
+    // Treat everything as float µg/m³
+    m.pm1  = bmv080.PM1();
+    m.pm25 = bmv080.PM25();
+    m.pm10 = bmv080.PM10();
+
+    m.obstructed = bmv080.isObstructed();
+    m.has_obstructed = true;
+  }
+}
+
+static bool readBmv080Snapshot(Measurements& m) {
+  // Values should already be kept warm by serviceBmv080()
+  return m.has_pm();
+}
+
+static bool readPms(Measurements& m) {
+  uint16_t pm1=0, pm25=0, pm10=0;
+  if (!pmsReadAtm(pm1, pm25, pm10)) return false;
+
+  // Normalize to float µg/m³ for consistency
+  m.pm1  = float(pm1);
+  m.pm25 = float(pm25);
+  m.pm10 = float(pm10);
+  return true;
+}
+
+static bool serviceIps7100(Measurements& m) {
+  bool updated = false;
+  String l;
+
+  while (ipsReadCsvLine(l, 0)) {
+    float pm1, pm25, pm10;
+    if (ipsParsePmFromLine(l, pm1, pm25, pm10)) {
+      m.pm1  = pm1;
+      m.pm25 = pm25;
+      m.pm10 = pm10;
+      updated = true;
+    }
+  }
+
+  return updated;
+}
+
+// --------------- Publishing (consistent formatting) ---------------
+static void publishPmTrio(const Measurements& m) {
+  // consistent: float, one decimal, µg/m³
+  publishOne("pm1",  String(m.pm1, 1));
+  publishOne("pm25", String(m.pm25, 1));
+  publishOne("pm10", String(m.pm10, 1));
+}
+
+static void publishSen66Extras(const Measurements& m) {
+  publishOne("pm4", String(m.pm4, 1));
+
+  if (m.has_env) {
+    publishOne("humidity",    String(m.rh, 1));
+    publishOne("temperature", String(m.tempC, 2));
+    publishOne("voc_index",   String(m.vocIdx, 1));
+    publishOne("nox_index",   String(m.noxIdx, 1));
+    publishOne("co2eq",       String(m.co2));
+  }
+}
+
+static void publishBmv080Extras(const Measurements& m) {
+  if (m.has_obstructed) {
+    publishOne("obstructed", m.obstructed ? "ON" : "OFF");
+  }
 }
 
 // --------------- PMS frame reader (ATM only) ---------------
@@ -490,15 +582,12 @@ bool pmsReadAtm(uint16_t &pm1, uint16_t &pm25, uint16_t &pm10) {
 
     if (!pmsReadExact(f + 2, FRAME_LEN - 2, 200)) return false;
 
-    // length must be 0x001C
     if (u16be(f + 2) != 0x001C) continue;
 
-    // checksum: sum bytes 0..29 equals uint16 at 30..31
     uint32_t sum = 0;
     for (int i = 0; i < 30; i++) sum += f[i];
     if ((uint16_t)sum != u16be(f + 30)) continue;
 
-    // ATM values at offsets 10/12/14
     pm1  = u16be(f + 10);
     pm25 = u16be(f + 12);
     pm10 = u16be(f + 14);
@@ -568,16 +657,18 @@ void loadConfig() {
   String styp = prefs.getString("sensor_type", cfg.sensor_type);
   prefs.end();
 
-  strncpy(cfg.mqtt_host, host.c_str(), sizeof(cfg.mqtt_host));
-  strncpy(cfg.mqtt_port, port.c_str(), sizeof(cfg.mqtt_port));
-  strncpy(cfg.mqtt_user, user.c_str(), sizeof(cfg.mqtt_user));
-  strncpy(cfg.mqtt_pass, pass.c_str(), sizeof(cfg.mqtt_pass));
-  strncpy(cfg.ha_prefix, pref.c_str(), sizeof(cfg.ha_prefix));
-  strncpy(cfg.friendly_name, name.c_str(), sizeof(cfg.friendly_name));
-  strncpy(cfg.sensor_type, styp.c_str(), sizeof(cfg.sensor_type));
+  strlcpy(cfg.mqtt_host, host.c_str(), sizeof(cfg.mqtt_host));
+  strlcpy(cfg.mqtt_port, port.c_str(), sizeof(cfg.mqtt_port));
+  strlcpy(cfg.mqtt_user, user.c_str(), sizeof(cfg.mqtt_user));
+  strlcpy(cfg.mqtt_pass, pass.c_str(), sizeof(cfg.mqtt_pass));
+  strlcpy(cfg.ha_prefix, pref.c_str(), sizeof(cfg.ha_prefix));
+  strlcpy(cfg.friendly_name, name.c_str(), sizeof(cfg.friendly_name));
+  strlcpy(cfg.sensor_type, styp.c_str(), sizeof(cfg.sensor_type));
 
-  if (strlen(cfg.ha_prefix) == 0) strncpy(cfg.ha_prefix, "homeassistant", sizeof(cfg.ha_prefix));
-  if (strlen(cfg.sensor_type) == 0) strncpy(cfg.sensor_type, "sen66", sizeof(cfg.sensor_type));
+  if (strlen(cfg.ha_prefix) == 0) strlcpy(cfg.ha_prefix, "homeassistant", sizeof(cfg.ha_prefix));
+  if (strlen(cfg.sensor_type) == 0) strlcpy(cfg.sensor_type, "sen66", sizeof(cfg.sensor_type));
+
+  normalizeSensorTypeInCfg();
 
   Serial.printf("Loaded config: MQTT %s:%s, HA prefix='%s', name='%s', sensor_type='%s'\n",
                 cfg.mqtt_host, cfg.mqtt_port, cfg.ha_prefix, cfg.friendly_name, cfg.sensor_type);
@@ -638,6 +729,15 @@ void publishOne(const String& suffix, const String& value) {
 }
 
 // --------------- Home Assistant Discovery ---------------
+static void haDeviceMeta(String& outManufacturer, String& outModel) {
+  switch (activeSensor) {
+    case SENSOR_SEN66:   outManufacturer = "Sensirion";     outModel = "SEN66"; break;
+    case SENSOR_BMV080:  outManufacturer = "Bosch";         outModel = "BMV080"; break;
+    case SENSOR_IPS7100: outManufacturer = "Piera Systems"; outModel = "IPS-7100"; break;
+    case SENSOR_PMS:     outManufacturer = "PMS-compatible"; outModel = "PMS UART"; break;
+  }
+}
+
 void publishDiscovery() {
   if (discovery_published) {
     Serial.println("Discovery already published, skipping.");
@@ -653,34 +753,27 @@ void publishDiscovery() {
   Serial.printf("Publishing HA discovery prefix='%s' device_id='%s' sensor='%s'\n",
                 cfg.ha_prefix, device_id.c_str(), sensorName);
 
-  if (activeSensor == SENSOR_SEN66) {
-    publishConfigSensor("pm1",        "PM1.0",       "µg/m³", "pm1",            "measurement", "mdi:blur",            "pm1");
-    publishConfigSensor("pm25",       "PM2.5",       "µg/m³", "pm25",           "measurement", "",                    "pm25");
-    publishConfigSensor("pm4",        "PM4.0",       "µg/m³", "",               "measurement", "mdi:blur",            "pm4");
-    publishConfigSensor("pm10",       "PM10",        "µg/m³", "pm10",           "measurement", "",                    "pm10");
-    publishConfigSensor("humidity",   "Humidity",    "%",     "humidity",       "measurement", "",                    "humidity");
-    publishConfigSensor("temperature","Temperature", "°C",    "temperature",    "measurement", "",                    "temperature");
-    publishConfigSensor("voc_index",  "VOC Index",   "",      "",               "measurement", "mdi:chemical-weapon", "voc_index");
-    publishConfigSensor("nox_index",  "NOx Index",   "",      "",               "measurement", "mdi:chemical-weapon", "nox_index");
-    publishConfigSensor("co2eq",      "CO2 (eq)",    "ppm",   "carbon_dioxide", "measurement", "",                    "co2eq");
-  } else if (activeSensor == SENSOR_BMV080) {
-    publishConfigSensor("pm1",   "PM1.0",  "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
-    publishConfigSensor("pm25",  "PM2.5",  "µg/m³", "pm25", "measurement", "",         "pm25");
-    publishConfigSensor("pm10",  "PM10",   "µg/m³", "pm10", "measurement", "",         "pm10");
+  // PM trio is always present across all sensors (consistent topics + units)
+  publishConfigSensor("pm1",  "PM1.0", "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
+  publishConfigSensor("pm25", "PM2.5", "µg/m³", "pm25", "measurement", "",         "pm25");
+  publishConfigSensor("pm10", "PM10",  "µg/m³", "pm10", "measurement", "",         "pm10");
 
+  // SEN66 extras
+  if (activeSensor == SENSOR_SEN66) {
+    publishConfigSensor("pm4",         "PM4.0",       "µg/m³", "",               "measurement", "mdi:blur",            "pm4");
+    publishConfigSensor("humidity",    "Humidity",    "%",     "humidity",       "measurement", "",                    "humidity");
+    publishConfigSensor("temperature", "Temperature", "°C",    "temperature",    "measurement", "",                    "temperature");
+    publishConfigSensor("voc_index",   "VOC Index",   "",      "",               "measurement", "mdi:chemical-weapon", "voc_index");
+    publishConfigSensor("nox_index",   "NOx Index",   "",      "",               "measurement", "mdi:chemical-weapon", "nox_index");
+    publishConfigSensor("co2eq",       "CO2 (eq)",    "ppm",   "carbon_dioxide", "measurement", "",                    "co2eq");
+  }
+
+  // BMV080 extras
+  if (activeSensor == SENSOR_BMV080) {
     publishConfigBinarySensor("obstructed", "Optics Obstructed",
                               "problem", "mdi:alert-circle",
                               "obstructed",
                               "ON", "OFF");
-  } else if (activeSensor == SENSOR_PMS) {
-    publishConfigSensor("pm1",   "PM1.0", "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
-    publishConfigSensor("pm25",  "PM2.5", "µg/m³", "pm25", "measurement", "",         "pm25");
-    publishConfigSensor("pm10",  "PM10",  "µg/m³", "pm10", "measurement", "",         "pm10");
-  } else {
-    // IPS7100: CSV float values
-    publishConfigSensor("pm1",   "PM1.0", "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
-    publishConfigSensor("pm25",  "PM2.5", "µg/m³", "pm25", "measurement", "",         "pm25");
-    publishConfigSensor("pm10",  "PM10",  "µg/m³", "pm10", "measurement", "",         "pm10");
   }
 
   discovery_published = true;
@@ -698,6 +791,9 @@ void publishConfigSensor(
 ) {
   String topic = String(cfg.ha_prefix) + "/sensor/" + device_id + "/" + object_id + "/config";
 
+  String manufacturer, model;
+  haDeviceMeta(manufacturer, model);
+
   String payload = "{";
   payload += "\"name\":\"" + name + "\",";
   payload += "\"unique_id\":\"" + device_id + "_" + object_id + "\",";
@@ -711,17 +807,8 @@ void publishConfigSensor(
 
   payload += "\"device\":{";
   payload +=   "\"identifiers\":[\"" + device_id + "\"],";
-
-  if (activeSensor == SENSOR_SEN66) {
-    payload += "\"manufacturer\":\"Sensirion\",\"model\":\"SEN66\",";
-  } else if (activeSensor == SENSOR_BMV080) {
-    payload += "\"manufacturer\":\"Bosch\",\"model\":\"BMV080\",";
-  } else if (activeSensor == SENSOR_IPS7100) {
-    payload += "\"manufacturer\":\"Piera Systems\",\"model\":\"IPS-7100\",";
-  } else {
-    payload += "\"manufacturer\":\"PMS-compatible\",\"model\":\"PMS UART\",";
-  }
-
+  payload +=   "\"manufacturer\":\"" + manufacturer + "\",";
+  payload +=   "\"model\":\"" + model + "\",";
   payload +=   "\"name\":\"" + String(cfg.friendly_name) + "\"";
   payload += "}";
   payload += "}";
@@ -742,6 +829,9 @@ void publishConfigBinarySensor(
 ) {
   String topic = String(cfg.ha_prefix) + "/binary_sensor/" + device_id + "/" + object_id + "/config";
 
+  String manufacturer, model;
+  haDeviceMeta(manufacturer, model);
+
   String payload = "{";
   payload += "\"name\":\"" + name + "\",";
   payload += "\"unique_id\":\"" + device_id + "_" + object_id + "\",";
@@ -755,8 +845,8 @@ void publishConfigBinarySensor(
 
   payload += "\"device\":{";
   payload +=   "\"identifiers\":[\"" + device_id + "\"],";
-  payload +=   "\"manufacturer\":\"Bosch\",";
-  payload +=   "\"model\":\"BMV080\",";
+  payload +=   "\"manufacturer\":\"" + manufacturer + "\",";
+  payload +=   "\"model\":\"" + model + "\",";
   payload +=   "\"name\":\"" + String(cfg.friendly_name) + "\"";
   payload += "}";
   payload += "}";
@@ -764,48 +854,6 @@ void publishConfigBinarySensor(
   bool ok = mqtt.publish(topic.c_str(), payload.c_str(), true);
   Serial.printf("HA binary_sensor config publish '%s': %s (len=%d)\n",
                 object_id.c_str(), ok ? "OK" : "FAILED", payload.length());
-}
-
-// --------------- State publishers ---------------
-void publishSen66State(float pm1, float pm25, float pm4, float pm10,
-                       float rh, float tempC, float vocIndex, float noxIndex, uint16_t co2) {
-  if (!discovery_published && mqtt.connected()) publishDiscovery();
-
-  publishOne("pm1",         String(pm1, 1));
-  publishOne("pm25",        String(pm25, 1));
-  publishOne("pm4",         String(pm4, 1));
-  publishOne("pm10",        String(pm10, 1));
-  publishOne("humidity",    String(rh, 1));
-  publishOne("temperature", String(tempC, 2));
-  publishOne("voc_index",   String(vocIndex, 1));
-  publishOne("nox_index",   String(noxIndex, 1));
-  publishOne("co2eq",       String(co2));
-}
-
-void publishBmv080State(float pm1, float pm25, float pm10, bool obstructed) {
-  if (!discovery_published && mqtt.connected()) publishDiscovery();
-
-  publishOne("pm1",  String(pm1, 2));
-  publishOne("pm25", String(pm25, 2));
-  publishOne("pm10", String(pm10, 2));
-  publishOne("obstructed", obstructed ? "ON" : "OFF");
-}
-
-void publishPmsState(uint16_t pm1, uint16_t pm25, uint16_t pm10) {
-  if (!discovery_published && mqtt.connected()) publishDiscovery();
-
-  publishOne("pm1",  String(pm1));
-  publishOne("pm25", String(pm25));
-  publishOne("pm10", String(pm10));
-}
-
-void publishIps7100State(float pm1, float pm25, float pm10) {
-  if (!discovery_published && mqtt.connected()) publishDiscovery();
-
-  // Publish with 3 decimals (sensor is float)
-  publishOne("pm1",  String(pm1, 3));
-  publishOne("pm25", String(pm25, 3));
-  publishOne("pm10", String(pm10, 3));
 }
 
 // --------------- Utilities ---------------
@@ -824,4 +872,28 @@ void safeTopicify(String &s) {
   s.replace("\\", "_");
   s.replace("+", "_");
   s.replace("#", "_");
+}
+
+// ---------------- Small helpers ----------------
+static void copyParam(char* dst, size_t dst_sz, const char* src) {
+  if (!dst || dst_sz == 0) return;
+  if (!src) { dst[0] = 0; return; }
+  strlcpy(dst, src, dst_sz);
+}
+
+static void normalizeSensorTypeInCfg() {
+  String st = String(cfg.sensor_type);
+  st.trim();
+  st.toLowerCase();
+  if (st != "bmv080" && st != "pms" && st != "ips7100" && st != "sen66") st = "sen66";
+  strlcpy(cfg.sensor_type, st.c_str(), sizeof(cfg.sensor_type));
+}
+
+static SensorType sensorTypeFromCfg() {
+  String st = String(cfg.sensor_type);
+  st.trim(); st.toLowerCase();
+  if (st == "bmv080") return SENSOR_BMV080;
+  if (st == "pms") return SENSOR_PMS;
+  if (st == "ips7100") return SENSOR_IPS7100;
+  return SENSOR_SEN66;
 }
